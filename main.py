@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import re
 from collections import Counter
@@ -14,7 +15,7 @@ from PIL import Image
 app = FastAPI(
     title="BrandIntel API",
     description="High-speed B2B Company & Domain Intelligence API. Enrich company domains with high-res logos, brand colors, detected tech stack, social media profiles, and contact info.",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 app.add_middleware(
@@ -27,7 +28,6 @@ app.add_middleware(
 
 RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
 
-# Realistic desktop browser fingerprint to bypass Cloudflare & WAF challenges
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -81,7 +81,6 @@ def clean_domain(raw_domain: str) -> str:
 
 
 def format_company_name(domain: str) -> str:
-    """Intelligently converts domain (e.g. sanasafinaz.com) into a clean title (e.g. Sana Safinaz)."""
     core = domain.split(".")[0]
     cleaned = re.sub(r"[-_]", " ", core)
     return cleaned.title()
@@ -158,7 +157,29 @@ def detect_tech_stack(html: str, headers: httpx.Headers) -> List[str]:
     return sorted(list(set(detected)))
 
 
-def extract_socials(soup: BeautifulSoup, base_url: str) -> Dict[str, Optional[str]]:
+def parse_social_link(url: str, socials: Dict[str, Optional[str]]) -> None:
+    """Classifies a URL into its social platform if valid."""
+    lower = url.lower()
+
+    if ("twitter.com/" in lower or "x.com/" in lower) and not socials["twitter"]:
+        if not any(x in lower for x in ["/share", "/intent", "/search", "/hashtag"]):
+            socials["twitter"] = url
+    elif ("linkedin.com/company" in lower or "linkedin.com/school" in lower) and not socials["linkedin"]:
+        socials["linkedin"] = url
+    elif "github.com/" in lower and not socials["github"]:
+        if not any(x in lower for x in ["/issues", "/pull", "/login", "/pricing", "/features", "/site"]):
+            socials["github"] = url
+    elif "instagram.com/" in lower and not socials["instagram"]:
+        if not any(x in lower for x in ["/p/", "/explore", "/accounts", "/reels"]):
+            socials["instagram"] = url
+    elif ("youtube.com/@" in lower or "youtube.com/channel" in lower or "youtube.com/c/" in lower or "youtube.com/user/" in lower) and not socials["youtube"]:
+        socials["youtube"] = url
+    elif "facebook.com/" in lower and not socials["facebook"]:
+        if not any(x in lower for x in ["/sharer", "/dialog", "/plugins", "/share.php"]):
+            socials["facebook"] = url
+
+
+def extract_socials_from_soup_and_html(soup: BeautifulSoup, html: str) -> Dict[str, Optional[str]]:
     socials: Dict[str, Optional[str]] = {
         "twitter": None,
         "linkedin": None,
@@ -168,26 +189,79 @@ def extract_socials(soup: BeautifulSoup, base_url: str) -> Dict[str, Optional[st
         "facebook": None,
     }
 
+    # 1. Inspect all <a> and button elements
+    for a in soup.find_all(["a", "link"], href=True):
+        parse_social_link(a["href"].strip(), socials)
+
+    # 2. Inspect Schema.org JSON-LD (sameAs array)
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            if not script.string:
+                continue
+            data = json.loads(script.string)
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if isinstance(item, dict):
+                    same_as = item.get("sameAs", [])
+                    if isinstance(same_as, str):
+                        same_as = [same_as]
+                    if isinstance(same_as, list):
+                        for link in same_as:
+                            if isinstance(link, str):
+                                parse_social_link(link.strip(), socials)
+        except Exception:
+            continue
+
+    # 3. Deep regex scan across raw HTML scripts and state
+    social_regex = re.findall(
+        r'https?://(?:www\.|[a-z]{2}\.)?(?:facebook\.com/[a-zA-Z0-9._-]+|instagram\.com/[a-zA-Z0-9._-]+|linkedin\.com/company/[a-zA-Z0-9._-]+|(?:twitter|x)\.com/[a-zA-Z0-9._-]+|youtube\.com/(?:@[a-zA-Z0-9._-]+|c/[a-zA-Z0-9._-]+|channel/[a-zA-Z0-9_-]+))',
+        html,
+    )
+    for match in social_regex:
+        parse_social_link(match, socials)
+
+    return socials
+
+
+async def discover_socials_with_subpages(
+    client: httpx.AsyncClient,
+    soup: BeautifulSoup,
+    html: str,
+    base_url: str,
+    domain: str,
+) -> Dict[str, Optional[str]]:
+    """Multi-source social discovery engine: extracts from homepage, schema, and crawls subpages."""
+    socials = extract_socials_from_soup_and_html(soup, html)
+
+    # If already found most socials, return immediately
+    found_count = sum(1 for v in socials.values() if v is not None)
+    if found_count >= 3:
+        return socials
+
+    # Find internal subpages (/about, /contact, /company)
+    subpage_urls = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         lower = href.lower()
+        if any(term in lower for term in ["/about", "/contact", "/company", "about-us", "contact-us"]):
+            full = urljoin(base_url, href)
+            if urlparse(full).netloc.endswith(domain) and full not in subpage_urls:
+                subpage_urls.append(full)
+            if len(subpage_urls) >= 2:
+                break
 
-        if ("twitter.com/" in lower or "x.com/" in lower) and not socials["twitter"]:
-            if not any(x in lower for x in ["/share", "/intent", "/search"]):
-                socials["twitter"] = href
-        elif "linkedin.com/company" in lower and not socials["linkedin"]:
-            socials["linkedin"] = href
-        elif "github.com/" in lower and not socials["github"]:
-            if not any(x in lower for x in ["/issues", "/pull", "/login", "/pricing"]):
-                socials["github"] = href
-        elif "instagram.com/" in lower and not socials["instagram"]:
-            if not any(x in lower for x in ["/p/", "/explore"]):
-                socials["instagram"] = href
-        elif ("youtube.com/@" in lower or "youtube.com/channel" in lower or "youtube.com/c/" in lower) and not socials["youtube"]:
-            socials["youtube"] = href
-        elif "facebook.com/" in lower and not socials["facebook"]:
-            if not any(x in lower for x in ["/sharer", "/dialog"]):
-                socials["facebook"] = href
+    # Crawl discovered subpage concurrently
+    for sub_url in subpage_urls:
+        try:
+            resp = await client.get(sub_url, headers=BROWSER_HEADERS, timeout=3.5)
+            if resp.status_code == 200:
+                sub_soup = BeautifulSoup(resp.text, "html.parser")
+                sub_socials = extract_socials_from_soup_and_html(sub_soup, resp.text)
+                for k, v in sub_socials.items():
+                    if not socials[k] and v:
+                        socials[k] = v
+        except Exception:
+            continue
 
     return socials
 
@@ -245,7 +319,6 @@ async def determine_brand_colors(
     soup: BeautifulSoup,
     logo_candidates: List[Optional[str]],
 ) -> List[str]:
-    """Extracts genuine brand colors, prioritizing pixel analysis over generic white/black meta tags."""
     extracted = []
 
     urls_to_try = [url for url in logo_candidates if url and not url.lower().endswith(".svg")]
@@ -358,7 +431,7 @@ def root():
         "service": "BrandIntel API",
         "status": "operational",
         "documentation": "/docs",
-        "version": "1.3.0",
+        "version": "1.4.0",
     }
 
 
@@ -372,7 +445,7 @@ async def enrich_company(
     domain: str = Query(..., description="Target company domain (e.g. stripe.com, shopify.com)"),
     x_rapidapi_proxy_secret: Optional[str] = Header(None),
 ):
-    """Full company intelligence with anti-bot sanitizer and customer support discovery."""
+    """Full company intelligence with multi-source social discovery and anti-bot bypass."""
     verify_rapidapi_request(x_rapidapi_proxy_secret)
     cleaned_domain = clean_domain(domain)
     target_url = f"https://{cleaned_domain}"
@@ -405,10 +478,19 @@ async def enrich_company(
                 description = desc_tag["content"].strip() if (desc_tag and desc_tag.get("content")) else None
 
             logos = extract_logos(soup, final_url, cleaned_domain)
-            socials = extract_socials(soup, final_url)
             tech_stack = detect_tech_stack(html, response.headers)
             contacts = extract_contacts(soup, html, final_url)
 
+            # Multi-source autonomous social discovery (Homepage + Schema JSON-LD + Deep Regex + Subpages)
+            socials = await discover_socials_with_subpages(
+                client=client,
+                soup=soup,
+                html=html,
+                base_url=final_url,
+                domain=cleaned_domain,
+            )
+
+            # Advanced pixel brand color extraction
             brand_colors = await determine_brand_colors(
                 client=client,
                 domain=cleaned_domain,
