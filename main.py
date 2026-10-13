@@ -14,7 +14,7 @@ from PIL import Image
 app = FastAPI(
     title="BrandIntel API",
     description="High-speed B2B Company & Domain Intelligence API. Enrich company domains with high-res logos, brand colors, detected tech stack, social media profiles, and contact info.",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 app.add_middleware(
@@ -27,11 +27,35 @@ app.add_middleware(
 
 RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
 
+# Realistic desktop browser fingerprint to bypass Cloudflare & WAF challenges
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 BrandIntel/1.2",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
+
+BOT_BLOCK_INDICATORS = [
+    "too many requests",
+    "just a moment",
+    "attention required",
+    "access denied",
+    "cloudflare",
+    "403 forbidden",
+    "429 too many requests",
+    "security check",
+    "ddos protection",
+    "robot or human",
+    "captcha",
+    "block",
+]
 
 
 def verify_rapidapi_request(secret_header: Optional[str]):
@@ -54,6 +78,20 @@ def clean_domain(raw_domain: str) -> str:
     if not re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", domain):
         raise HTTPException(status_code=400, detail=f"Invalid domain format: '{raw_domain}'")
     return domain
+
+
+def format_company_name(domain: str) -> str:
+    """Intelligently converts domain (e.g. sanasafinaz.com) into a clean title (e.g. Sana Safinaz)."""
+    core = domain.split(".")[0]
+    cleaned = re.sub(r"[-_]", " ", core)
+    return cleaned.title()
+
+
+def is_bot_block_text(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    lower = text.strip().lower()
+    return any(indicator in lower for indicator in BOT_BLOCK_INDICATORS)
 
 
 TECH_SIGNATURES: Dict[str, Dict[str, List[str]]] = {
@@ -169,23 +207,19 @@ async def extract_dominant_colors_from_image(client: httpx.AsyncClient, image_ur
         color_counts = Counter()
 
         for r, g, b, a in pixels:
-            # Skip transparent pixels
             if a < 100:
                 continue
 
             brightness = (r * 299 + g * 587 + b * 114) / 1000
             saturation = max(r, g, b) - min(r, g, b)
 
-            # Ignore pure whites and dark grays
             if brightness > 240 or brightness < 20:
                 continue
 
-            # Quantize color to 16-step bins
             qr = min(255, (r // 16) * 16 + 8)
             qg = min(255, (g // 16) * 16 + 8)
             qb = min(255, (b // 16) * 16 + 8)
 
-            # Heavy bonus weight for vivid, colorful pixels
             weight = 5 if saturation > 50 else (2 if saturation > 20 else 1)
             color_counts[(qr, qg, qb)] += weight
 
@@ -214,7 +248,6 @@ async def determine_brand_colors(
     """Extracts genuine brand colors, prioritizing pixel analysis over generic white/black meta tags."""
     extracted = []
 
-    # Priority 1: Analyze pixels of the logo and high-res icons
     urls_to_try = [url for url in logo_candidates if url and not url.lower().endswith(".svg")]
     urls_to_try.append(f"https://www.google.com/s2/favicons?domain={domain}&sz=128")
 
@@ -224,7 +257,6 @@ async def determine_brand_colors(
             extracted.extend(pixel_colors)
             break
 
-    # Priority 2: Check meta theme-color if not pure black/white
     theme_color = soup.find("meta", attrs={"name": "theme-color"})
     if theme_color and theme_color.get("content"):
         c = theme_color["content"].strip().upper()
@@ -232,7 +264,6 @@ async def determine_brand_colors(
             if c not in extracted:
                 extracted.append(c)
 
-    # Return top vibrant colors, or default monochrome
     return extracted[:4] if extracted else ["#0A0A0A"]
 
 
@@ -265,30 +296,25 @@ def extract_logos(soup: BeautifulSoup, base_url: str, domain: str) -> Dict[str, 
 
 
 def extract_contacts(soup: BeautifulSoup, html: str, base_url: str) -> Dict[str, Optional[object]]:
-    """Intelligently detects customer support emails, phones, help centers, and contact pages."""
     raw_emails = set()
     raw_phones = set()
 
-    # 1. Search mailto: links
     for mailto in soup.find_all("a", href=re.compile(r"^mailto:", re.I)):
         raw = mailto["href"].replace("mailto:", "").split("?")[0].strip().lower()
         if re.match(r"^[\w\.-]+@[\w\.-]+\.\w+$", raw):
             raw_emails.add(raw)
 
-    # 2. Search raw text email patterns
     text_matches = re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b", html)
     for email in text_matches:
         lower = email.lower()
         if not any(lower.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif", ".js", ".css"]):
             raw_emails.add(lower)
 
-    # 3. Search tel: links
     for tel in soup.find_all("a", href=re.compile(r"^tel:", re.I)):
         raw = tel["href"].replace("tel:", "").strip()
         if len(raw) >= 7:
             raw_phones.add(raw)
 
-    # 4. Search Contact Us & Help Center Links
     contact_page = None
     help_center = None
 
@@ -302,7 +328,6 @@ def extract_contacts(soup: BeautifulSoup, html: str, base_url: str) -> Dict[str,
         elif not help_center and any(k in href_lower or k in text for k in ["help-center", "support", "/help", "knowledgebase"]):
             help_center = urljoin(base_url, href)
 
-    # 5. Prioritize Customer Care / Support Email
     support_email = None
     general_emails = []
 
@@ -315,7 +340,6 @@ def extract_contacts(soup: BeautifulSoup, html: str, base_url: str) -> Dict[str,
     if not support_email and general_emails:
         support_email = general_emails.pop(0)
 
-    # 6. Prioritize Customer Support Phone
     support_phone = sorted(list(raw_phones))[0] if raw_phones else None
 
     return {
@@ -334,7 +358,7 @@ def root():
         "service": "BrandIntel API",
         "status": "operational",
         "documentation": "/docs",
-        "version": "1.2.0",
+        "version": "1.3.0",
     }
 
 
@@ -348,7 +372,7 @@ async def enrich_company(
     domain: str = Query(..., description="Target company domain (e.g. stripe.com, shopify.com)"),
     x_rapidapi_proxy_secret: Optional[str] = Header(None),
 ):
-    """Full company intelligence: Logos, brand colors, detected tech stack, socials, and support contacts."""
+    """Full company intelligence with anti-bot sanitizer and customer support discovery."""
     verify_rapidapi_request(x_rapidapi_proxy_secret)
     cleaned_domain = clean_domain(domain)
     target_url = f"https://{cleaned_domain}"
@@ -359,25 +383,32 @@ async def enrich_company(
             html = response.text
             soup = BeautifulSoup(html, "html.parser")
             final_url = str(response.url)
+            status_code = response.status_code
 
-            # Title & Description
-            title = None
+            # Title extraction with bot-blocker sanitization
+            raw_title = None
             if soup.title and soup.title.string:
-                title = soup.title.string.strip()
+                raw_title = soup.title.string.strip()
             elif soup.find("meta", property="og:title"):
-                title = soup.find("meta", property="og:title").get("content", "").strip()
+                raw_title = soup.find("meta", property="og:title").get("content", "").strip()
 
-            description = None
-            desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", property="og:description")
-            if desc_tag and desc_tag.get("content"):
-                description = desc_tag["content"].strip()
+            is_bot_blocked = status_code in [403, 429] or is_bot_block_text(raw_title)
+
+            if is_bot_blocked or not raw_title:
+                clean_name = format_company_name(cleaned_domain)
+                title = clean_name
+                description = f"Company intelligence profile for {clean_name}."
+            else:
+                clean_name = raw_title.split(" - ")[0].split(" | ")[0].strip()
+                title = raw_title
+                desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", property="og:description")
+                description = desc_tag["content"].strip() if (desc_tag and desc_tag.get("content")) else None
 
             logos = extract_logos(soup, final_url, cleaned_domain)
             socials = extract_socials(soup, final_url)
             tech_stack = detect_tech_stack(html, response.headers)
             contacts = extract_contacts(soup, html, final_url)
 
-            # Advanced pixel brand color extraction
             brand_colors = await determine_brand_colors(
                 client=client,
                 domain=cleaned_domain,
@@ -393,7 +424,7 @@ async def enrich_company(
 
     return {
         "domain": cleaned_domain,
-        "name": title.split(" - ")[0].split(" | ")[0] if title else cleaned_domain.capitalize(),
+        "name": clean_name,
         "title": title,
         "description": description,
         "brand_assets": {
@@ -406,9 +437,10 @@ async def enrich_company(
         "technology_stack": tech_stack,
         "contacts": contacts,
         "meta": {
-            "status_code": response.status_code,
+            "status_code": status_code,
             "final_url": final_url,
             "secured_ssl": final_url.startswith("https://"),
+            "bot_protected": is_bot_blocked,
         },
     }
 
