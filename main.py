@@ -14,7 +14,7 @@ from PIL import Image
 app = FastAPI(
     title="BrandIntel API",
     description="High-speed B2B Company & Domain Intelligence API. Enrich company domains with high-res logos, brand colors, detected tech stack, social media profiles, and contact info.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -26,6 +26,12 @@ app.add_middleware(
 )
 
 RAPIDAPI_PROXY_SECRET = os.getenv("RAPIDAPI_PROXY_SECRET", "")
+
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 BrandIntel/1.2",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 def verify_rapidapi_request(secret_header: Optional[str]):
@@ -148,29 +154,10 @@ def extract_socials(soup: BeautifulSoup, base_url: str) -> Dict[str, Optional[st
     return socials
 
 
-def extract_meta_theme_colors(soup: BeautifulSoup) -> List[str]:
-    colors = []
-    theme_color = soup.find("meta", attrs={"name": "theme-color"})
-    if theme_color and theme_color.get("content"):
-        colors.append(theme_color["content"].strip())
-
-    ms_tile = soup.find("meta", attrs={"name": "msapplication-TileColor"})
-    if ms_tile and ms_tile.get("content"):
-        colors.append(ms_tile["content"].strip())
-
-    valid_hex = []
-    for c in colors:
-        c = c.upper()
-        if re.match(r"^#(?:[0-9A-F]{3}){1,2}$", c) and c not in ["#000000", "#FFFFFF", "#000", "#FFF"]:
-            valid_hex.append(c)
-
-    return list(dict.fromkeys(valid_hex))
-
-
 async def extract_dominant_colors_from_image(client: httpx.AsyncClient, image_url: str) -> List[str]:
-    """Downloads the brand icon/logo and inspects actual pixels to extract vibrant brand colors."""
+    """Downloads brand logo/icon and analyzes pixel RGB values to detect primary vibrant brand colors."""
     try:
-        resp = await client.get(image_url, timeout=3.5)
+        resp = await client.get(image_url, headers=BROWSER_HEADERS, timeout=4.0)
         if resp.status_code != 200 or not resp.content:
             return []
 
@@ -186,21 +173,20 @@ async def extract_dominant_colors_from_image(client: httpx.AsyncClient, image_ur
             if a < 100:
                 continue
 
-            # Brightness and saturation checks
             brightness = (r * 299 + g * 587 + b * 114) / 1000
             saturation = max(r, g, b) - min(r, g, b)
 
-            # Filter out pure whites, transparent grays, and near-black
-            if brightness > 240 or brightness < 25:
+            # Ignore pure whites and dark grays
+            if brightness > 240 or brightness < 20:
                 continue
 
-            # Quantize color to 16-step bins to group shades
+            # Quantize color to 16-step bins
             qr = min(255, (r // 16) * 16 + 8)
             qg = min(255, (g // 16) * 16 + 8)
             qb = min(255, (b // 16) * 16 + 8)
 
-            # Strongly prioritize saturated, vivid brand colors over gray
-            weight = 4 if saturation > 50 else (2 if saturation > 25 else 1)
+            # Heavy bonus weight for vivid, colorful pixels
+            weight = 5 if saturation > 50 else (2 if saturation > 20 else 1)
             color_counts[(qr, qg, qb)] += weight
 
         if not color_counts:
@@ -225,23 +211,29 @@ async def determine_brand_colors(
     soup: BeautifulSoup,
     logo_candidates: List[Optional[str]],
 ) -> List[str]:
-    """Combines meta tags and pixel analysis to extract the truest brand color palette."""
-    colors = extract_meta_theme_colors(soup)
+    """Extracts genuine brand colors, prioritizing pixel analysis over generic white/black meta tags."""
+    extracted = []
 
-    # Pixel inspect image candidates (apple-touch-icon, logo, or Google 128px fallback)
+    # Priority 1: Analyze pixels of the logo and high-res icons
     urls_to_try = [url for url in logo_candidates if url and not url.lower().endswith(".svg")]
     urls_to_try.append(f"https://www.google.com/s2/favicons?domain={domain}&sz=128")
 
     for url in urls_to_try:
-        img_colors = await extract_dominant_colors_from_image(client, url)
-        if img_colors:
-            for c in img_colors:
-                if c not in colors:
-                    colors.append(c)
+        pixel_colors = await extract_dominant_colors_from_image(client, url)
+        if pixel_colors:
+            extracted.extend(pixel_colors)
             break
 
-    # If nothing colorful detected, provide safe default
-    return colors[:4] if colors else ["#0A0A0A"]
+    # Priority 2: Check meta theme-color if not pure black/white
+    theme_color = soup.find("meta", attrs={"name": "theme-color"})
+    if theme_color and theme_color.get("content"):
+        c = theme_color["content"].strip().upper()
+        if re.match(r"^#(?:[0-9A-F]{3}){1,2}$", c) and c not in ["#FFFFFF", "#000000", "#FFF", "#000"]:
+            if c not in extracted:
+                extracted.append(c)
+
+    # Return top vibrant colors, or default monochrome
+    return extracted[:4] if extracted else ["#0A0A0A"]
 
 
 def extract_logos(soup: BeautifulSoup, base_url: str, domain: str) -> Dict[str, Optional[str]]:
@@ -272,23 +264,67 @@ def extract_logos(soup: BeautifulSoup, base_url: str, domain: str) -> Dict[str, 
     }
 
 
-def extract_contacts(soup: BeautifulSoup, html: str) -> Dict[str, List[str]]:
-    emails = set()
-    phones = set()
+def extract_contacts(soup: BeautifulSoup, html: str, base_url: str) -> Dict[str, Optional[object]]:
+    """Intelligently detects customer support emails, phones, help centers, and contact pages."""
+    raw_emails = set()
+    raw_phones = set()
 
+    # 1. Search mailto: links
     for mailto in soup.find_all("a", href=re.compile(r"^mailto:", re.I)):
-        raw = mailto["href"].replace("mailto:", "").split("?")[0].strip()
+        raw = mailto["href"].replace("mailto:", "").split("?")[0].strip().lower()
         if re.match(r"^[\w\.-]+@[\w\.-]+\.\w+$", raw):
-            emails.add(raw)
+            raw_emails.add(raw)
 
+    # 2. Search raw text email patterns
+    text_matches = re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b", html)
+    for email in text_matches:
+        lower = email.lower()
+        if not any(lower.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif", ".js", ".css"]):
+            raw_emails.add(lower)
+
+    # 3. Search tel: links
     for tel in soup.find_all("a", href=re.compile(r"^tel:", re.I)):
         raw = tel["href"].replace("tel:", "").strip()
         if len(raw) >= 7:
-            phones.add(raw)
+            raw_phones.add(raw)
+
+    # 4. Search Contact Us & Help Center Links
+    contact_page = None
+    help_center = None
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        text = a.get_text().strip().lower()
+        href_lower = href.lower()
+
+        if not contact_page and any(k in href_lower or k in text for k in ["contact-us", "/contact", "contact"]):
+            contact_page = urljoin(base_url, href)
+        elif not help_center and any(k in href_lower or k in text for k in ["help-center", "support", "/help", "knowledgebase"]):
+            help_center = urljoin(base_url, href)
+
+    # 5. Prioritize Customer Care / Support Email
+    support_email = None
+    general_emails = []
+
+    for email in sorted(list(raw_emails)):
+        if not support_email and any(email.startswith(prefix) for prefix in ["support@", "help@", "care@", "customercare@", "service@", "info@", "contact@"]):
+            support_email = email
+        else:
+            general_emails.append(email)
+
+    if not support_email and general_emails:
+        support_email = general_emails.pop(0)
+
+    # 6. Prioritize Customer Support Phone
+    support_phone = sorted(list(raw_phones))[0] if raw_phones else None
 
     return {
-        "emails": sorted(list(emails))[:5],
-        "phones": sorted(list(phones))[:3],
+        "customer_support_email": support_email,
+        "customer_support_phone": support_phone,
+        "contact_page_url": contact_page,
+        "help_center_url": help_center,
+        "all_emails_found": sorted(list(raw_emails)),
+        "all_phones_found": sorted(list(raw_phones)),
     }
 
 
@@ -298,7 +334,7 @@ def root():
         "service": "BrandIntel API",
         "status": "operational",
         "documentation": "/docs",
-        "version": "1.1.0",
+        "version": "1.2.0",
     }
 
 
@@ -312,20 +348,14 @@ async def enrich_company(
     domain: str = Query(..., description="Target company domain (e.g. stripe.com, shopify.com)"),
     x_rapidapi_proxy_secret: Optional[str] = Header(None),
 ):
-    """Full company intelligence: Logos, brand colors, detected tech stack, socials, and metadata."""
+    """Full company intelligence: Logos, brand colors, detected tech stack, socials, and support contacts."""
     verify_rapidapi_request(x_rapidapi_proxy_secret)
     cleaned_domain = clean_domain(domain)
     target_url = f"https://{cleaned_domain}"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 BrandIntel/1.1",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
     try:
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, verify=False) as client:
-            response = await client.get(target_url, headers=headers)
+            response = await client.get(target_url, headers=BROWSER_HEADERS)
             html = response.text
             soup = BeautifulSoup(html, "html.parser")
             final_url = str(response.url)
@@ -345,7 +375,7 @@ async def enrich_company(
             logos = extract_logos(soup, final_url, cleaned_domain)
             socials = extract_socials(soup, final_url)
             tech_stack = detect_tech_stack(html, response.headers)
-            contacts = extract_contacts(soup, html)
+            contacts = extract_contacts(soup, html, final_url)
 
             # Advanced pixel brand color extraction
             brand_colors = await determine_brand_colors(
